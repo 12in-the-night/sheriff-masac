@@ -1,6 +1,10 @@
 """
 MASAC on 2× T4 — 10M params, 8× vectorized env, gradient all-reduce.
-Batch 32768 fills VRAM (~12 GB per T4). LR 2e-3 (scaled with batch).
+
+FIXES in this version vs the crashing run:
+  1. Actor.forward() clamps logits to [-20, 20]  → prevents entropy collapse to 0
+  2. target_entropy = -0.5 × sum(log(act_dims))  → ≈ -16.8, not -246
+  3. alpha_loss sign corrected + .detach()        → alpha tunes DOWN, not up
 """
 import os, sys, time, atexit, socket, random, argparse, subprocess, webbrowser
 from collections import deque
@@ -27,14 +31,14 @@ from vec_env import VectorizedSheriff
 
 
 # ============================================================
-# Config — 10M params per agent, batch 32768
+# Config
 # ============================================================
 HIDDEN          = 1147           # 9,996,597 params per agent (~10M)
 BATCH_SIZE      = 32768          # total; 16384 per rank → ~12 GB VRAM/T4
-BUFFER_CAPACITY = 200_000        # per rank per agent (5 agents → 1M total)
-UPDATE_EVERY    = 4              # env steps between gradient updates
-WARMUP_STEPS    = 70             # real episode length (7 phases × 10 rounds)
-N_VEC           = 8              # parallel envs per rank
+BUFFER_CAPACITY = 200_000
+UPDATE_EVERY    = 4
+WARMUP_STEPS    = 70
+N_VEC           = 8
 USE_AMP         = True
 
 
@@ -123,9 +127,10 @@ class Actor(nn.Module):
         )
         self.heads = nn.ModuleList([nn.Linear(hidden, d) for d in act_dims])
 
+    # ---- FIX 1: clamp logits to [-20, 20] ----
     def forward(self, obs):
         h = self.net(obs)
-        return [head(h) for head in self.heads]
+        return [torch.clamp(head(h), -20.0, 20.0) for head in self.heads]
 
     def sample(self, obs):
         logits = self.forward(obs)
@@ -190,11 +195,11 @@ class MASACAgent(nn.Module):
         self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=lr)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=lr)
 
+        # ---- FIX 2: target_entropy uses log(dims) not dims ----
         if target_entropy is None:
-            target_entropy = -0.5 * sum(act_dims)
+            target_entropy = -0.5 * float(np.log(np.array(act_dims, dtype=np.float64)).sum())
         self.target_entropy = target_entropy
 
-        # nn.Parameter so it moves with .to(device)
         self.log_alpha = nn.Parameter(torch.tensor(np.log(alpha)))
         self.alpha_opt = optim.Adam([self.log_alpha], lr=lr)
         self.alpha = self.log_alpha.exp().item()
@@ -202,7 +207,6 @@ class MASACAgent(nn.Module):
         self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def _allreduce_grads(self, module):
-        """Average gradients across all ranks."""
         if not dist.is_initialized():
             return
         world = dist.get_world_size()
@@ -267,7 +271,9 @@ class MASACAgent(nn.Module):
         # ---- Alpha ----
         with torch.no_grad(), ac:
             entropy = self.actor.entropy(obs).mean()
-        alpha_loss = -(self.log_alpha * (entropy - self.target_entropy)).mean()
+
+        # ---- FIX 3: correct sign + detach target ----
+        alpha_loss = (self.log_alpha * (entropy - self.target_entropy).detach()).mean()
 
         self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
@@ -304,7 +310,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
     world_size  = dist.get_world_size()
     is_main     = (global_rank == 0)
 
-    # Same init for both ranks → identical starting weights
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -320,14 +325,12 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
         print(f"[Profile] buffer={BUFFER_CAPACITY}/rank, update_every={UPDATE_EVERY}, amp={USE_AMP}")
         print(f"[Device]  {device}, rank={global_rank}, world={world_size}")
 
-    # Reference env (for action/obs spaces)
     env = SheriffEnv(config_path)
     env.reset(seed=seed)
     agents_ids = env.possible_agents
     obs_dim    = env.observation_spaces[agents_ids[0]].shape[0]
     act_dims   = [int(x) for x in env.action_spaces[agents_ids[0]].nvec]
 
-    # Per-rank seed for env workers (different episodes per rank)
     np.random.seed(seed + local_rank)
     torch.manual_seed(seed + local_rank)
 
@@ -337,26 +340,26 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                             use_amp=USE_AMP).to(device)
               for a in agents_ids}
 
-    # Broadcast rank-0 weights to all ranks (identical starting point)
     for a in agents_ids:
         for p in agents[a].parameters():
             dist.broadcast(p.data, src=0)
 
     if is_main:
         n_params = sum(p.numel() for p in agents[agents_ids[0]].parameters())
+        agent0 = agents[agents_ids[0]]
         print(f"[Model]   {n_params:,} params/agent × {len(agents_ids)} agents "
               f"= {n_params * len(agents_ids) / 1e6:.1f}M total")
-        print(f"[Model]   all_reduce sync enabled (world={world_size})")
+        print(f"[Model]   target_entropy={agent0.target_entropy:.2f} "
+              f"(should be ≈ -16.8)")
 
     if is_main:
         writer.add_hparams(
             {"hidden": HIDDEN, "batch_size": BATCH_SIZE, "buffer_cap": BUFFER_CAPACITY,
              "update_every": UPDATE_EVERY, "lr": lr, "world_size": world_size,
-             "n_vec": N_VEC},
+             "n_vec": N_VEC, "target_entropy": agents[agents_ids[0]].target_entropy},
             {},
         )
 
-    # Vectorized env
     vec = VectorizedSheriff(n_envs=N_VEC, config_path=config_path,
                             base_seed=seed + local_rank * 100_000)
 
@@ -371,17 +374,12 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
     info = {"actor_loss": 0.0, "critic_loss": 0.0, "alpha": 0.0,
             "entropy": 0.0, "mean_q": 0.0}
 
-    # Initial reset
     obs_list      = vec.reset()
     done_list     = [False] * N_VEC
     ep_rew_list   = [{a: 0.0 for a in agents_ids} for _ in range(N_VEC)]
     ep_steps_list = [0] * N_VEC
 
-    # ============================================================
-    # Main loop
-    # ============================================================
     while episodes_done < total_episodes:
-        # ---- 1. Build actions for all live envs ----
         live_idxs = [i for i in range(N_VEC) if not done_list[i]]
         live_actions = []
         for i in live_idxs:
@@ -392,10 +390,8 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                         for a in agents_ids}
             live_actions.append(acts)
 
-        # ---- 2. Step all live envs in parallel ----
         results = vec.step_all(live_actions)
 
-        # ---- 3. Ingest results ----
         for j, i in enumerate(live_idxs):
             obs, rew, done = results[j]
 
@@ -415,7 +411,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                     episode_returns[a].append(ep_rew_list[i][a])
                 episode_lengths.append(ep_steps_list[i])
 
-                # Reset only this env
                 obs_list[i]      = vec.reset_single(i)
                 done_list[i]     = False
                 ep_rew_list[i]   = {a: 0.0 for a in agents_ids}
@@ -428,8 +423,8 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                           f" | ep_len: {np.mean(episode_lengths):6.1f}")
                     print(f"        actor={info['actor_loss']:.3f} "
                           f"critic={info['critic_loss']:.3f} "
-                          f"alpha={info['alpha']:.3f} "
-                          f"entropy={info['entropy']:.1f}")
+                          f"alpha={info['alpha']:.4f} "
+                          f"entropy={info['entropy']:.2f}")
 
                 if is_main:
                     for a in agents_ids:
@@ -440,7 +435,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                     writer.add_scalar("episode/total_steps", total_steps,        episodes_done)
                     writer.add_scalar("episode/wall_time_s", time.time() - train_start, episodes_done)
 
-        # ---- 4. Gradient updates ----
         if (total_steps >= warmup_episodes * WARMUP_STEPS
             and total_steps % UPDATE_EVERY == 0):
             for a in agents_ids:
@@ -454,7 +448,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                             writer.add_scalar(f"{tag}/{k}", info[k], update_count)
                     update_count += 1
 
-    # ---- Cleanup ----
     vec.close()
 
     if is_main:
