@@ -50,7 +50,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP  # Per-GPU model wr
 from torch.utils.tensorboard import SummaryWriter  # Scalar + hparam logging
 
 # ---------------- Local imports ----------------
-from env import SheriffEnv          # Our PettingZoo environment
+from sheriff_env import SheriffEnv          # Our PettingZoo environment
 
 
 # ============================================================
