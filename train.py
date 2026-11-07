@@ -1,5 +1,6 @@
 """
 MASAC on 2× T4 — 10M params, 8× vectorized env, gradient all-reduce.
+Batch 32768 fills VRAM (~12 GB per T4). LR 2e-3 (scaled with batch).
 """
 import os, sys, time, atexit, socket, random, argparse, subprocess, webbrowser
 from collections import deque
@@ -26,14 +27,14 @@ from vec_env import VectorizedSheriff
 
 
 # ============================================================
-# Config — 10M params per agent
+# Config — 10M params per agent, batch 32768
 # ============================================================
-HIDDEN          = 1147           # 9.997M params per agent
-BATCH_SIZE      = 8192           # total; 4096 per rank
-BUFFER_CAPACITY = 200_000        # per rank per agent
-UPDATE_EVERY    = 2              # env steps between gradient updates
-WARMUP_STEPS    = 70             # real episode length
-N_VEC           = 8              # parallel games per rank
+HIDDEN          = 1147           # 9,996,597 params per agent (~10M)
+BATCH_SIZE      = 32768          # total; 16384 per rank → ~12 GB VRAM/T4
+BUFFER_CAPACITY = 200_000        # per rank per agent (5 agents → 1M total)
+UPDATE_EVERY    = 4              # env steps between gradient updates
+WARMUP_STEPS    = 70             # real episode length (7 phases × 10 rounds)
+N_VEC           = 8              # parallel envs per rank
 USE_AMP         = True
 
 
@@ -201,6 +202,7 @@ class MASACAgent(nn.Module):
         self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def _allreduce_grads(self, module):
+        """Average gradients across all ranks."""
         if not dist.is_initialized():
             return
         world = dist.get_world_size()
@@ -288,7 +290,7 @@ class MASACAgent(nn.Module):
 
 
 def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
-          lr=1e-3, gamma=0.99, tau=0.005, seed=42, log_dir="runs",
+          lr=2e-3, gamma=0.99, tau=0.005, seed=42, log_dir="runs",
           log_every_updates=20, auto_tensorboard=True):
 
     if "LOCAL_RANK" not in os.environ:
@@ -315,36 +317,36 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
     if is_main:
         print(f"[Mode]    GRADIENT ALL-REDUCE + {N_VEC}× vectorized env")
         print(f"[Profile] hidden={HIDDEN}, batch={BATCH_SIZE} ({BATCH_SIZE//world_size}/GPU)")
-        print(f"[Profile] buffer={BUFFER_CAPACITY}/rank, update_every={UPDATE_EVERY}")
+        print(f"[Profile] buffer={BUFFER_CAPACITY}/rank, update_every={UPDATE_EVERY}, amp={USE_AMP}")
         print(f"[Device]  {device}, rank={global_rank}, world={world_size}")
 
-    # Reference env (for action spaces only)
+    # Reference env (for action/obs spaces)
     env = SheriffEnv(config_path)
     env.reset(seed=seed)
     agents_ids = env.possible_agents
     obs_dim    = env.observation_spaces[agents_ids[0]].shape[0]
     act_dims   = [int(x) for x in env.action_spaces[agents_ids[0]].nvec]
 
-    # Seed env workers per-rank differently so ranks see different data
+    # Per-rank seed for env workers (different episodes per rank)
     np.random.seed(seed + local_rank)
     torch.manual_seed(seed + local_rank)
 
     buffers = {a: ReplayBuffer(BUFFER_CAPACITY, obs_dim, act_dims) for a in agents_ids}
 
-    # Build agents AFTER per-rank seed — but then reset to global seed so
-    # ranks have IDENTICAL model weights (needed for all-reduce symmetry).
     agents = {a: MASACAgent(obs_dim, act_dims, HIDDEN, lr, gamma, tau,
                             use_amp=USE_AMP).to(device)
               for a in agents_ids}
-    # Sync weights across ranks
+
+    # Broadcast rank-0 weights to all ranks (identical starting point)
     for a in agents_ids:
         for p in agents[a].parameters():
             dist.broadcast(p.data, src=0)
 
     if is_main:
         n_params = sum(p.numel() for p in agents[agents_ids[0]].parameters())
-        print(f"[Model]   {n_params:,} params per agent × {len(agents_ids)} agents")
-        print(f"          total {n_params * len(agents_ids) / 1e6:.1f}M")
+        print(f"[Model]   {n_params:,} params/agent × {len(agents_ids)} agents "
+              f"= {n_params * len(agents_ids) / 1e6:.1f}M total")
+        print(f"[Model]   all_reduce sync enabled (world={world_size})")
 
     if is_main:
         writer.add_hparams(
@@ -354,7 +356,7 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
             {},
         )
 
-    # Vectorized env — base_seed differs per rank so they see different data
+    # Vectorized env
     vec = VectorizedSheriff(n_envs=N_VEC, config_path=config_path,
                             base_seed=seed + local_rank * 100_000)
 
@@ -369,7 +371,7 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
     info = {"actor_loss": 0.0, "critic_loss": 0.0, "alpha": 0.0,
             "entropy": 0.0, "mean_q": 0.0}
 
-    # ---- Initial reset of all vec envs ----
+    # Initial reset
     obs_list      = vec.reset()
     done_list     = [False] * N_VEC
     ep_rew_list   = [{a: 0.0 for a in agents_ids} for _ in range(N_VEC)]
@@ -407,7 +409,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
             ep_steps_list[i] += 1
             total_steps      += 1
 
-            # ---- Episode finished on env i ----
             if done:
                 episodes_done += 1
                 for a in agents_ids:
@@ -420,7 +421,6 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                 ep_rew_list[i]   = {a: 0.0 for a in agents_ids}
                 ep_steps_list[i] = 0
 
-                # ---- Logging ----
                 if is_main and episodes_done % 50 == 0:
                     avg = {a: np.mean(episode_returns[a]) for a in agents_ids}
                     print(f"Ep {episodes_done:5d} | " +
@@ -431,10 +431,9 @@ def train(config_path="config.yaml", total_episodes=12000, warmup_episodes=50,
                           f"alpha={info['alpha']:.3f} "
                           f"entropy={info['entropy']:.1f}")
 
-                # TensorBoard episode-level
                 if is_main:
                     for a in agents_ids:
-                        writer.add_scalar(f"return/episode/{a}",    ep_rew_list[i][a] if False else ep_rew_list[i][a], episodes_done)
+                        writer.add_scalar(f"return/episode/{a}",    ep_rew_list[i][a], episodes_done)
                         writer.add_scalar(f"return/moving_avg/{a}", np.mean(episode_returns[a]), episodes_done)
                     writer.add_scalar("episode/length",      ep_steps_list[i],  episodes_done)
                     writer.add_scalar("episode/length_avg",  np.mean(episode_lengths), episodes_done)
@@ -483,7 +482,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--episodes", type=int,   default=12000)
     p.add_argument("--warmup",   type=int,   default=50)
-    p.add_argument("--lr",       type=float, default=1e-3)
+    p.add_argument("--lr",       type=float, default=2e-3)
     p.add_argument("--seed",     type=int,   default=42)
     p.add_argument("--no-tb",    action="store_true")
     args = p.parse_args()
