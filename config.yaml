@@ -1,0 +1,50 @@
+# ============================================================
+# Sheriff of Nottingham — configuration
+# ============================================================
+
+game:                                                   # Game-wide settings
+  num_players: 5                                        # 3-5 players
+  max_sheriff_turns: 2                                  # Each serves sheriff twice
+  starting_gold: 50                                     # Starting gold
+  max_hand: 6                                           # Hand size cap
+  max_bag: 5                                            # Bag size cap
+  max_discard: 5                                        # Market discard cap
+  max_bribe: 50                                         # Gold bribe cap (= starting_gold)
+  max_bribe_goods: 8                                    # Max stand cards per goods bribe
+  max_steps: 300                                        # Episode truncation
+  use_royal: true                                       # Include Royal Goods
+  n_messages: 8                                         # Message vocabulary size
+
+legal_goods:                                            # Blue cards (declarable)
+  Apple:   { value: 2, penalty: 2, count: 36 }          # Apple
+  Cheese:  { value: 3, penalty: 3, count: 36 }          # Cheese
+  Bread:   { value: 3, penalty: 3, count: 36 }          # Bread
+  Chicken: { value: 4, penalty: 4, count: 36 }          # Chicken
+
+contraband:                                             # Red cards (must smuggle)
+  Pepper:   { value: 6, penalty: 6, count: 18 }         # Pepper
+  Mead:     { value: 7, penalty: 7, count: 18 }         # Mead
+  Silk:     { value: 8, penalty: 8, count: 18 }         # Silk
+  Crossbow: { value: 9, penalty: 9, count: 18 }         # Crossbow
+
+royal_goods:                                            # Royal Goods promo
+  Royal Apple:   { value: 2, penalty: 4, count: 3 }     # Royal Apple
+  Royal Cheese:  { value: 3, penalty: 4, count: 3 }     # Royal Cheese
+  Royal Bread:   { value: 3, penalty: 4, count: 3 }     # Royal Bread
+  Royal Chicken: { value: 4, penalty: 4, count: 3 }     # Royal Chicken
+
+king_queen_bonuses:                                     # KQ bonuses per legal type
+  Apple:   { king: 20, queen: 10 }                      # Apple bonus
+  Cheese:  { king: 15, queen: 10 }                      # Cheese bonus
+  Bread:   { king: 15, queen: 10 }                      # Bread bonus
+  Chicken: { king: 10, queen: 5 }                       # Chicken bonus
+
+# ------------------------------------------------------------
+# Rewards — SCORE ONLY
+# Dense signal: (current_total - prev_total) * weight
+# Terminal: final_score * multiplier (+ win_bonus if winner)
+# ------------------------------------------------------------
+rewards:
+  score_shaping_weight: 0.10                            # Per-step score delta weight
+  score_multiplier:     0.910                             # Final score weight
+  win_bonus:           50.0                             # Extra reward to the winner
