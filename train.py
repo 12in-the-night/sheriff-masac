@@ -1,10 +1,29 @@
 """
-MASAC-Discrete training for SheriffEnv with auto-launched TensorBoard.
+MASAC-Discrete for SheriffEnv — 2× T4 (32 GB), maxed out.
+============================================================
+
+Profile:
+  - 2× NVIDIA T4 via DDP (DistributedDataParallel)
+  - hidden = 2048
+  - batch_size = 32768 (total, DDP splits to 16384 per GPU)
+  - replay buffer = 2,000,000 transitions (in RAM)
+  - update_every = 4 env steps
+  - FP16 autocast + GradScaler (Tensor Cores)
+  - pinned memory + non_blocking transfers
+  - auto-launched TensorBoard
+
+VRAM: ~11–13 GB per T4, ~22–26 GB total of 32 GB.
 
 Run:
-    python train_masac.py
+  # Linux / Colab / cloud
+  MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 \\
+    python -m torch.distributed.run --nproc_per_node=2 \\
+    train_masac_t4x2.py --lr 1e-3
 
-TensorBoard starts automatically and the browser opens to the dashboard.
+  # Windows
+  set MASTER_ADDR=127.0.0.1
+  set MASTER_PORT=29500
+  python -m torch.distributed.run --nproc_per_node=2 train_masac_t4x2.py --lr 1e-3
 """
 import os
 import sys
@@ -12,6 +31,7 @@ import time
 import atexit
 import socket
 import random
+import argparse
 import subprocess
 import webbrowser
 from collections import deque
@@ -22,16 +42,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from sheriff_env import SheriffEnv
 
 
 # ============================================================
-# 0. Auto-launch TensorBoard
+# FIXED PROFILE — do not edit unless you know what you're doing
+# ============================================================
+HIDDEN          = 2048
+BATCH_SIZE      = 32768        # total; DDP splits to 16384 per GPU
+BUFFER_CAPACITY = 2_000_000    # in RAM, not VRAM
+UPDATE_EVERY    = 4            # env steps between updates
+USE_AMP         = True
+
+
+# ============================================================
+# TensorBoard auto-launch
 # ============================================================
 def _find_free_port(start_port=6006, max_tries=20):
-    """Find the next free TCP port starting from start_port."""
     for p in range(start_port, start_port + max_tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -39,43 +70,26 @@ def _find_free_port(start_port=6006, max_tries=20):
                 return p
             except OSError:
                 continue
-    raise RuntimeError(f"No free port found between {start_port} and {start_port + max_tries}")
+    raise RuntimeError(f"No free port {start_port}..{start_port + max_tries}")
 
 
-def start_tensorboard(log_dir: str, open_browser: bool = True) -> subprocess.Popen:
-    """
-    Launch TensorBoard as a background subprocess and open the browser.
-    Kills the subprocess automatically on Python exit.
-    """
-    port = _find_free_port(6006)
-    cmd = [
-        sys.executable, "-m", "tensorboard.main",
-        "--logdir", log_dir,
-        "--port", str(port),
-        "--reload_interval", "5",
-    ]
+def start_tensorboard(log_dir, open_browser=True):
+    port = _find_free_port()
+    cmd = [sys.executable, "-m", "tensorboard.main",
+           "--logdir", log_dir, "--port", str(port), "--reload_interval", "5"]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
-        print("[TensorBoard] Not installed. Run: pip install tensorboard")
+        print("[TensorBoard] pip install tensorboard")
         return None
-
-    # Give it a moment to bind the port
     time.sleep(2.0)
-
     url = f"http://localhost:{port}"
-    print(f"[TensorBoard] Running at {url}")
+    print(f"[TensorBoard] {url}")
     if open_browser:
         try:
             webbrowser.open(url)
         except Exception:
-            print(f"[TensorBoard] Open manually: {url}")
-
-    # Kill on Python exit
+            pass
     atexit.register(lambda: _safe_kill(proc))
     return proc
 
@@ -94,7 +108,7 @@ def _safe_kill(proc):
 
 
 # ============================================================
-# 1. Replay Buffer
+# Replay Buffer (RAM, pinned)
 # ============================================================
 class ReplayBuffer:
     def __init__(self, capacity, obs_dim, act_dims):
@@ -116,25 +130,24 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, device):
         idx = np.random.randint(0, self.size, size=batch_size)
-        return (
-            torch.as_tensor(self.obs[idx]),
-            torch.as_tensor(self.act[idx]),
-            torch.as_tensor(self.rew[idx]).unsqueeze(-1),
-            torch.as_tensor(self.next_obs[idx]),
-            torch.as_tensor(self.done[idx]).unsqueeze(-1),
-        )
+        obs      = torch.as_tensor(self.obs[idx],      dtype=torch.float32).to(device, non_blocking=True)
+        act      = torch.as_tensor(self.act[idx],      dtype=torch.int64  ).to(device, non_blocking=True)
+        rew      = torch.as_tensor(self.rew[idx],      dtype=torch.float32).to(device, non_blocking=True).unsqueeze(-1)
+        next_obs = torch.as_tensor(self.next_obs[idx], dtype=torch.float32).to(device, non_blocking=True)
+        done     = torch.as_tensor(self.done[idx],     dtype=torch.float32).to(device, non_blocking=True).unsqueeze(-1)
+        return obs, act, rew, next_obs, done
 
     def __len__(self):
         return self.size
 
 
 # ============================================================
-# 2. Actor
+# Actor — Multi-Discrete categorical
 # ============================================================
 class Actor(nn.Module):
-    def __init__(self, obs_dim, act_dims, hidden=256):
+    def __init__(self, obs_dim, act_dims, hidden):
         super().__init__()
         self.act_dims = act_dims
         self.net = nn.Sequential(
@@ -168,10 +181,10 @@ class Actor(nn.Module):
 
 
 # ============================================================
-# 3. Twin Critic
+# Twin Critic
 # ============================================================
 class TwinCritic(nn.Module):
-    def __init__(self, obs_dim, act_dims, hidden=256):
+    def __init__(self, obs_dim, act_dims, hidden):
         super().__init__()
         self.act_dims = act_dims
         in_dim = obs_dim + sum(act_dims)
@@ -197,33 +210,36 @@ class TwinCritic(nn.Module):
 
 
 # ============================================================
-# 4. MASAC Agent
+# MASAC Agent
 # ============================================================
-class MASACAgent:
-    def __init__(self, obs_dim, act_dims, lr=3e-4, gamma=0.99,
-                 tau=0.005, alpha=0.2, target_entropy=None, device="cpu"):
-        self.device = device
+class MASACAgent(nn.Module):
+    def __init__(self, obs_dim, act_dims, hidden, lr, gamma, tau,
+                 alpha=0.2, target_entropy=None, use_amp=True):
+        super().__init__()
         self.gamma = gamma
         self.tau = tau
         self.act_dims = act_dims
+        self.use_amp = use_amp
 
-        self.actor         = Actor(obs_dim, act_dims).to(device)
-        self.critic        = TwinCritic(obs_dim, act_dims).to(device)
-        self.critic_target = TwinCritic(obs_dim, act_dims).to(device)
+        self.actor         = Actor(obs_dim, act_dims, hidden)
+        self.critic        = TwinCritic(obs_dim, act_dims, hidden)
+        self.critic_target = TwinCritic(obs_dim, act_dims, hidden)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.actor_opt  = optim.Adam(self.actor.parameters(), lr=lr)
+        self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=lr)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=lr)
 
         if target_entropy is None:
             target_entropy = -0.5 * sum(act_dims)
         self.target_entropy = target_entropy
-        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
+        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True)
         self.alpha_opt = optim.Adam([self.log_alpha], lr=lr)
         self.alpha = self.log_alpha.exp().item()
 
-    def select_action(self, obs, eval_mode=False):
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    def select_action(self, obs, device, eval_mode=False):
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
             logits = self.actor(obs_t)
             out = []
@@ -234,36 +250,50 @@ class MASACAgent:
 
     def update(self, batch):
         obs, act, rew, next_obs, done = batch
+        ac = torch.cuda.amp.autocast(enabled=self.use_amp)
 
-        with torch.no_grad():
+        # ----- Critic -----
+        with torch.no_grad(), ac:
             next_act, next_logp = self.actor.sample(next_obs)
             q1_t, q2_t = self.critic_target(next_obs, next_act)
             q_t = torch.min(q1_t, q2_t) - self.alpha * next_logp
             target_q = rew + self.gamma * (1.0 - done) * q_t
 
-        q1, q2 = self.critic(obs, act)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        self.critic_opt.step()
+        with ac:
+            q1, q2 = self.critic(obs, act)
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        new_act, new_logp = self.actor.sample(obs)
-        q1_new, q2_new = self.critic(obs, new_act)
-        q_new = torch.min(q1_new, q2_new)
-        actor_loss = (self.alpha * new_logp - q_new).mean()
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        self.actor_opt.step()
+        self.critic_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.step(self.critic_opt)
+        self.scaler.update()
 
-        entropy = self.actor.entropy(obs).mean()
-        alpha_loss = (self.log_alpha * (entropy - self.target_entropy).detach()).mean()
-        self.alpha_opt.zero_grad()
+        # ----- Actor -----
+        with ac:
+            new_act, new_logp = self.actor.sample(obs)
+            q1_new, q2_new = self.critic(obs, new_act)
+            q_new = torch.min(q1_new, q2_new)
+            actor_loss = (self.alpha * new_logp - q_new).mean()
+
+        self.actor_opt.zero_grad(set_to_none=True)
+        self.scaler.scale(actor_loss).backward()
+        self.scaler.step(self.actor_opt)
+        self.scaler.update()
+
+        # ----- Alpha -----
+        with torch.no_grad(), ac:
+            entropy = self.actor.entropy(obs).mean()
+        alpha_loss = -(self.log_alpha * (entropy - self.target_entropy)).mean()
+
+        self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_opt.step()
         self.alpha = self.log_alpha.exp().item()
 
-        for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
-            tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+        # ----- Soft target -----
+        with torch.no_grad():
+            for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
+                tp.data.mul_(1 - self.tau).add_(p.data, alpha=self.tau)
 
         return {
             "critic_loss": critic_loss.item(),
@@ -275,68 +305,88 @@ class MASACAgent:
 
 
 # ============================================================
-# 5. Training loop
+# Training loop — DDP, 2× T4
 # ============================================================
-def train_masac(
-    config_path="config.yaml",
-    total_episodes=5000,
-    warmup_episodes=50,
-    batch_size=256,
-    buffer_capacity=500_000,
-    lr=3e-4,
-    gamma=0.99,
-    tau=0.005,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    seed=42,
-    log_dir="runs",
-    log_every_updates=10,
-    auto_tensorboard=True,
-):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def train(config_path="config.yaml",
+          total_episodes=5000,
+          warmup_episodes=50,
+          lr=1e-3,
+          gamma=0.99,
+          tau=0.005,
+          seed=42,
+          log_dir="runs",
+          log_every_updates=20,
+          auto_tensorboard=True):
 
-    run_name = f"masac_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # ----- DDP init -----
+    if "LOCAL_RANK" not in os.environ:
+        raise RuntimeError(
+            "Run with: python -m torch.distributed.run --nproc_per_node=2 train_masac_t4x2.py"
+        )
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group("nccl", init_method="env://")
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    is_main = (local_rank == 0)
+
+    # ----- Seeding -----
+    random.seed(seed + local_rank)
+    np.random.seed(seed + local_rank)
+    torch.manual_seed(seed + local_rank)
+    torch.backends.cudnn.benchmark = True
+
+    # ----- TensorBoard -----
+    run_name = f"masac_t4x2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_path = os.path.join(log_dir, run_name)
-    writer = SummaryWriter(run_path)
-    print(f"[Logs] {run_path}")
+    writer   = SummaryWriter(run_path) if is_main else None
+    tb_proc  = start_tensorboard(log_dir) if (auto_tensorboard and is_main) else None
 
-    tb_proc = None
-    if auto_tensorboard:
-        tb_proc = start_tensorboard(log_dir, open_browser=True)
+    if is_main:
+        print(f"[Profile] hidden={HIDDEN}, batch={BATCH_SIZE} (DDP → {BATCH_SIZE // 2}/GPU)")
+        print(f"[Profile] buffer={BUFFER_CAPACITY}, update_every={UPDATE_EVERY}, amp={USE_AMP}")
+        print(f"[Device]  {device}, world_size={dist.get_world_size()}")
+        print(f"[Logs]    {run_path}")
 
+    # ----- Env -----
     env = SheriffEnv(config_path)
     env.reset(seed=seed)
-
     agents_ids = env.possible_agents
     obs_dim    = env.observation_spaces[agents_ids[0]].shape[0]
     act_dims   = [int(x) for x in env.action_spaces[agents_ids[0]].nvec]
 
-    buffers = {a: ReplayBuffer(buffer_capacity, obs_dim, act_dims) for a in agents_ids}
-    agents  = {
-        a: MASACAgent(obs_dim, act_dims, lr=lr, gamma=gamma, tau=tau, device=device)
-        for a in agents_ids
-    }
+    # ----- Buffers & agents -----
+    buffers = {a: ReplayBuffer(BUFFER_CAPACITY, obs_dim, act_dims) for a in agents_ids}
 
-    writer.add_hparams(
-        {
-            "lr": lr, "gamma": gamma, "tau": tau,
-            "batch_size": batch_size, "buffer_cap": buffer_capacity,
-            "total_eps": total_episodes, "warmup_eps": warmup_episodes,
-            "target_entropy": -0.5 * sum(act_dims),
-            "device": device, "seed": seed,
-        },
-        {},
-    )
+    agents = {}
+    for a in agents_ids:
+        agent = MASACAgent(obs_dim, act_dims, HIDDEN, lr, gamma, tau,
+                           use_amp=USE_AMP).to(device)
+        agents[a] = DDP(agent, device_ids=[local_rank], output_device=local_rank)
 
-    print(f"Device: {device} | Agents: {agents_ids} | Obs: {obs_dim} | Act: {act_dims}")
+    if is_main:
+        n_params = sum(p.numel() for p in agents[agents_ids[0]].parameters())
+        print(f"[Model]   {n_params:,} params per agent × {len(agents_ids)} agents")
 
+    # ----- Hparams -----
+    if is_main:
+        writer.add_hparams(
+            {"hidden": HIDDEN, "batch_size": BATCH_SIZE, "buffer_cap": BUFFER_CAPACITY,
+             "update_every": UPDATE_EVERY, "use_amp": USE_AMP,
+             "lr": lr, "gamma": gamma, "tau": tau,
+             "total_eps": total_episodes, "world_size": dist.get_world_size()},
+            {},
+        )
+
+    # ----- State -----
     episode_returns = {a: deque(maxlen=100) for a in agents_ids}
     episode_lengths = deque(maxlen=100)
     total_steps = 0
-    global_update_step = 0
+    update_count = 0
     train_start = time.time()
+    info = {"actor_loss": 0.0, "critic_loss": 0.0, "alpha": 0.0,
+            "entropy": 0.0, "mean_q": 0.0}
 
+    # ----- Loop -----
     for ep in range(total_episodes):
         obs_dict, _ = env.reset()
         done = False
@@ -349,7 +399,7 @@ def train_masac(
                 if total_steps < warmup_episodes * 300:
                     actions[a] = env.action_spaces[a].sample()
                 else:
-                    actions[a] = agents[a].select_action(obs_dict[a])
+                    actions[a] = agents[a].module.select_action(obs_dict[a], device)
 
             next_obs_dict, rew_dict, term_dict, trunc_dict, _ = env.step(actions)
             done = all(term_dict.values()) or all(trunc_dict.values())
@@ -364,84 +414,83 @@ def train_masac(
             ep_steps += 1
             total_steps += 1
 
-            if total_steps >= warmup_episodes * 300:
+            if (total_steps >= warmup_episodes * 300
+                and total_steps % UPDATE_EVERY == 0):
                 for a in agents_ids:
-                    if len(buffers[a]) >= batch_size:
-                        batch = tuple(t.to(device) for t in buffers[a].sample(batch_size))
+                    if len(buffers[a]) >= BATCH_SIZE:
+                        batch = buffers[a].sample(BATCH_SIZE, device)
                         info = agents[a].update(batch)
 
-                        if global_update_step % log_every_updates == 0:
+                        if is_main and update_count % log_every_updates == 0:
                             tag = f"agent/{a}"
-                            writer.add_scalar(f"{tag}/actor_loss",  info["actor_loss"],  global_update_step)
-                            writer.add_scalar(f"{tag}/critic_loss", info["critic_loss"], global_update_step)
-                            writer.add_scalar(f"{tag}/alpha",       info["alpha"],       global_update_step)
-                            writer.add_scalar(f"{tag}/entropy",     info["entropy"],     global_update_step)
-                            writer.add_scalar(f"{tag}/mean_q",      info["mean_q"],      global_update_step)
-                            writer.add_scalar(f"{tag}/target_entropy",
-                                              agents[a].target_entropy, global_update_step)
-
-                        global_update_step += 1
+                            writer.add_scalar(f"{tag}/actor_loss",  info["actor_loss"],  update_count)
+                            writer.add_scalar(f"{tag}/critic_loss", info["critic_loss"], update_count)
+                            writer.add_scalar(f"{tag}/alpha",       info["alpha"],       update_count)
+                            writer.add_scalar(f"{tag}/entropy",     info["entropy"],     update_count)
+                            writer.add_scalar(f"{tag}/mean_q",      info["mean_q"],      update_count)
+                        update_count += 1
 
         for a in agents_ids:
             episode_returns[a].append(ep_rew[a])
         episode_lengths.append(ep_steps)
 
-        for a in agents_ids:
-            writer.add_scalar(f"return/episode/{a}",    ep_rew[a], ep)
-            writer.add_scalar(f"return/moving_avg/{a}", np.mean(episode_returns[a]), ep)
-        writer.add_scalar("episode/length",      ep_steps,                  ep)
-        writer.add_scalar("episode/length_avg",  np.mean(episode_lengths),  ep)
-        writer.add_scalar("episode/total_steps", total_steps,               ep)
-        writer.add_scalar("episode/wall_time_s", time.time() - train_start, ep)
+        if is_main:
+            for a in agents_ids:
+                writer.add_scalar(f"return/episode/{a}",    ep_rew[a], ep)
+                writer.add_scalar(f"return/moving_avg/{a}", np.mean(episode_returns[a]), ep)
+            writer.add_scalar("episode/length",      ep_steps,                  ep)
+            writer.add_scalar("episode/length_avg",  np.mean(episode_lengths),  ep)
+            writer.add_scalar("episode/total_steps", total_steps,               ep)
+            writer.add_scalar("episode/wall_time_s", time.time() - train_start, ep)
 
-        if (ep + 1) % 50 == 0:
-            avg = {a: np.mean(episode_returns[a]) for a in agents_ids}
-            print(f"Ep {ep+1:5d} | " +
-                  " | ".join([f"{a}: {avg[a]:7.2f}" for a in agents_ids]) +
-                  f" | ep_len: {np.mean(episode_lengths):6.1f}")
-            if total_steps >= warmup_episodes * 300:
+            if (ep + 1) % 50 == 0:
+                avg = {a: np.mean(episode_returns[a]) for a in agents_ids}
+                print(f"Ep {ep+1:5d} | "
+                      + " | ".join([f"{a}: {avg[a]:7.2f}" for a in agents_ids])
+                      + f" | ep_len: {np.mean(episode_lengths):6.1f}")
                 print(f"        actor_loss={info['actor_loss']:.4f} "
                       f"critic_loss={info['critic_loss']:.4f} "
-                      f"alpha={info['alpha']:.4f} "
-                      f"entropy={info['entropy']:.3f} "
-                      f"mean_q={info['mean_q']:.3f}")
+                      f"alpha={info['alpha']:.4f} entropy={info['entropy']:.3f}")
 
-    writer.add_hparams(
-        {
-            "lr": lr, "gamma": gamma, "tau": tau,
-            "batch_size": batch_size, "buffer_cap": buffer_capacity,
-            "total_eps": total_episodes, "warmup_eps": warmup_episodes,
-            "target_entropy": -0.5 * sum(act_dims),
-            "device": device, "seed": seed,
-        },
-        {f"final_return/{a}": float(np.mean(episode_returns[a])) for a in agents_ids},
-    )
+    # ----- Save -----
+    if is_main:
+        os.makedirs("masac_checkpoints", exist_ok=True)
+        for a in agents_ids:
+            inner = agents[a].module
+            torch.save({
+                "actor":         inner.actor.state_dict(),
+                "critic":        inner.critic.state_dict(),
+                "critic_target": inner.critic_target.state_dict(),
+            }, f"masac_checkpoints/{a}.pt")
+        print("Saved → masac_checkpoints/")
+        writer.flush()
+        writer.close()
+        _safe_kill(tb_proc)
 
-    os.makedirs("masac_checkpoints", exist_ok=True)
-    for a in agents_ids:
-        torch.save({
-            "actor":         agents[a].actor.state_dict(),
-            "critic":        agents[a].critic.state_dict(),
-            "critic_target": agents[a].critic_target.state_dict(),
-        }, f"masac_checkpoints/{a}.pt")
-    print("Saved → masac_checkpoints/")
-
-    writer.flush()
-    writer.close()
-    _safe_kill(tb_proc)
-    return agents
+    dist.destroy_process_group()
 
 
 # ============================================================
-# 6. Entry point
+# Entry
 # ============================================================
-if __name__ == "__main__":
-    train_masac(
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", type=int,   default=5000)
+    parser.add_argument("--warmup",   type=int,   default=50)
+    parser.add_argument("--lr",       type=float, default=1e-3)
+    parser.add_argument("--seed",     type=int,   default=42)
+    parser.add_argument("--no-tb",    action="store_true")
+    args = parser.parse_args()
+
+    train(
         config_path="config.yaml",
-        total_episodes=5000,
-        warmup_episodes=50,
-        batch_size=256,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        log_dir="runs",
-        auto_tensorboard=True,
+        total_episodes=args.episodes,
+        warmup_episodes=args.warmup,
+        lr=args.lr,
+        seed=args.seed,
+        auto_tensorboard=(not args.no_tb),
     )
+
+
+if __name__ == "__main__":
+    main()
