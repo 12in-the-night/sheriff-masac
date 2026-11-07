@@ -58,8 +58,8 @@ from env import SheriffEnv          # Our PettingZoo environment
 # ============================================================
 HIDDEN          = 2048         # Width of every hidden layer in Actor + Critic
 BATCH_SIZE      = 32768        # Total across DDP; splits to 16384 per GPU
-BUFFER_CAPACITY = 2_000_000    # Replay buffer size, lives in RAM not VRAM
-UPDATE_EVERY    = 4            # Env steps between gradient updates
+BUFFER_CAPACITY = 4_000_000    # Replay buffer size, lives in RAM not VRAM
+UPDATE_EVERY    = 8            # Env steps between gradient updates
 USE_AMP         = True         # FP16 autocast + GradScaler (Tensor Cores)
 
 
