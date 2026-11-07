@@ -1,37 +1,15 @@
 """
-MASAC-Discrete for SheriffEnv — 2× T4 (32 GB), maxed out.
-
-Fixes applied in this version vs the previous run:
-  - CPU thread pinning: OMP/MKL/OpenBLAS=2, torch.set_num_threads(2)
-  - warmup shortened: warmup_episodes * 70 (was * 300)
-  - UPDATE_EVERY=4 (was 8) — more frequent gradient steps
-  - is_main uses dist.get_rank() — fixes duplicate [Profile]/[Logs] prints
-  - torch.amp.GradScaler('cuda') — deprecated warning silenced
-  - BUFFER_CAPACITY=2M — 4M × 5 agents ≈ 8 GB RAM, tight on Kaggle
+MASAC on 2× T4 via manual gradient all-reduce.
+Same model init on both ranks, different env data, averaged gradients.
 """
-import os
-import sys
-import time
-import atexit
-import socket
-import random
-import argparse
-import subprocess
-import webbrowser
+import os, sys, time, atexit, socket, random, argparse, subprocess, webbrowser
 from collections import deque
 from datetime import datetime
 
-# ---------------- CPU threads: MUST be set before torch import ----------------
-# Kaggle T4 x2 gives 4 vCPUs. DDP runs 2 processes. 2 × 2 = 4 = perfect fit.
-# Setting these higher will cause CPU thrash and slow everything down.
 _N_THREADS = 2
 os.environ.setdefault("OMP_NUM_THREADS",       str(_N_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS",       str(_N_THREADS))
 os.environ.setdefault("OPENBLAS_NUM_THREADS",  str(_N_THREADS))
-os.environ.setdefault("NUMEXPR_NUM_THREADS",   str(_N_THREADS))
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS",str(_N_THREADS))
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS",str(_N_THREADS))
-os.environ.setdefault("TF_NUM_INTEROP_THREADS","1")
 
 import numpy as np
 import torch
@@ -39,31 +17,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-# ---------------- PyTorch thread pinning: MUST be after import torch ----------------
-# PyTorch ignores OMP env and spawns its own thread pools unless explicitly told.
 torch.set_num_threads(_N_THREADS)
 torch.set_num_interop_threads(1)
 
 from env import SheriffEnv
 
 
-# ============================================================
-# Fixed profile — tuned for max util on 2× T4 / 32 GB
-# ============================================================
-HIDDEN          = 2048          # Width of every hidden layer
-BATCH_SIZE      = 32768         # Total; DDP splits to 16384 per GPU
-BUFFER_CAPACITY = 2_000_000     # Per-agent buffer; 2M × 5 ≈ 4 GB RAM
-UPDATE_EVERY    = 4             # Env steps between gradient updates
-WARMUP_STEPS    = 70            # Match real episode length (7 phases × 10 rounds)
+HIDDEN          = 2048
+BATCH_SIZE      = 32768          # total; 16384 per rank
+BUFFER_CAPACITY = 1_000_000      # per rank; 2 ranks × 5 agents ≈ 4 GB RAM
+UPDATE_EVERY    = 4
+WARMUP_STEPS    = 70
 USE_AMP         = True
 
 
-# ============================================================
-# TensorBoard auto-launch
-# ============================================================
 def _find_free_port(start_port=6006, max_tries=20):
     for p in range(start_port, start_port + max_tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -72,7 +41,7 @@ def _find_free_port(start_port=6006, max_tries=20):
                 return p
             except OSError:
                 continue
-    raise RuntimeError(f"No free port {start_port}..{start_port + max_tries}")
+    raise RuntimeError(f"No free port")
 
 
 def start_tensorboard(log_dir, open_browser=True):
@@ -100,18 +69,12 @@ def _safe_kill(proc):
     if proc is None or proc.poll() is not None:
         return
     try:
-        proc.terminate()
-        proc.wait(timeout=3)
+        proc.terminate(); proc.wait(timeout=3)
     except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        try: proc.kill()
+        except Exception: pass
 
 
-# ============================================================
-# Replay Buffer
-# ============================================================
 class ReplayBuffer:
     def __init__(self, capacity, obs_dim, act_dims):
         self.capacity = capacity
@@ -145,9 +108,6 @@ class ReplayBuffer:
         return self.size
 
 
-# ============================================================
-# Actor
-# ============================================================
 class Actor(nn.Module):
     def __init__(self, obs_dim, act_dims, hidden):
         super().__init__()
@@ -166,10 +126,10 @@ class Actor(nn.Module):
         logits = self.forward(obs)
         actions, log_probs = [], []
         for logit in logits:
-            dist_cat = torch.distributions.Categorical(logits=logit)
-            a = dist_cat.sample()
+            d = torch.distributions.Categorical(logits=logit)
+            a = d.sample()
             actions.append(a)
-            log_probs.append(dist_cat.log_prob(a))
+            log_probs.append(d.log_prob(a))
         actions = torch.stack(actions, dim=-1)
         log_prob = torch.stack(log_probs, dim=-1).sum(dim=-1, keepdim=True)
         return actions, log_prob
@@ -182,9 +142,6 @@ class Actor(nn.Module):
         return ent.unsqueeze(-1)
 
 
-# ============================================================
-# Twin Critic
-# ============================================================
 class TwinCritic(nn.Module):
     def __init__(self, obs_dim, act_dims, hidden):
         super().__init__()
@@ -211,9 +168,6 @@ class TwinCritic(nn.Module):
         return self.q1(x), self.q2(x)
 
 
-# ============================================================
-# MASAC Agent
-# ============================================================
 class MASACAgent(nn.Module):
     def __init__(self, obs_dim, act_dims, hidden, lr, gamma, tau,
                  alpha=0.2, target_entropy=None, use_amp=True):
@@ -234,12 +188,30 @@ class MASACAgent(nn.Module):
         if target_entropy is None:
             target_entropy = -0.5 * sum(act_dims)
         self.target_entropy = target_entropy
-        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True)
+
+        # FIX: nn.Parameter so it moves with .to(device)
+        self.log_alpha = nn.Parameter(torch.tensor(np.log(alpha)))
         self.alpha_opt = optim.Adam([self.log_alpha], lr=lr)
         self.alpha = self.log_alpha.exp().item()
 
-        # Deprecation fix: torch.cuda.amp.GradScaler → torch.amp.GradScaler('cuda')
         self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    def _allreduce_grads(self, module):
+        """Average gradients across all ranks (SUM then divide)."""
+        if not dist.is_initialized():
+            return
+        world = dist.get_world_size()
+        for p in module.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad /= world
+
+    def _allreduce_param_grad(self, param):
+        if not dist.is_initialized() or param.grad is None:
+            return
+        world = dist.get_world_size()
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad /= world
 
     def select_action(self, obs, device, eval_mode=False):
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -247,18 +219,15 @@ class MASACAgent(nn.Module):
             logits = self.actor(obs_t)
             out = []
             for logit in logits:
-                if eval_mode:
-                    out.append(logit.argmax(-1).item())
-                else:
-                    out.append(torch.distributions.Categorical(logits=logit).sample().item())
+                out.append((logit.argmax(-1) if eval_mode
+                            else torch.distributions.Categorical(logits=logit).sample()).item())
         return np.array(out, dtype=np.int64)
 
     def update(self, batch):
         obs, act, rew, next_obs, done = batch
-        # Deprecation fix: torch.cuda.amp.autocast → torch.amp.autocast('cuda')
         ac = torch.amp.autocast("cuda", enabled=self.use_amp)
 
-        # ---------- Critic ----------
+        # ---- Critic ----
         with torch.no_grad(), ac:
             next_act, next_logp = self.actor.sample(next_obs)
             q1_t, q2_t = self.critic_target(next_obs, next_act)
@@ -271,10 +240,12 @@ class MASACAgent(nn.Module):
 
         self.critic_opt.zero_grad(set_to_none=True)
         self.scaler.scale(critic_loss).backward()
+        self.scaler.unscale_(self.critic_opt)   # unscale so all_reduce is on true grads
+        self._allreduce_grads(self.critic)
         self.scaler.step(self.critic_opt)
         self.scaler.update()
 
-        # ---------- Actor ----------
+        # ---- Actor ----
         with ac:
             new_act, new_logp = self.actor.sample(obs)
             q1_new, q2_new = self.critic(obs, new_act)
@@ -283,20 +254,23 @@ class MASACAgent(nn.Module):
 
         self.actor_opt.zero_grad(set_to_none=True)
         self.scaler.scale(actor_loss).backward()
+        self.scaler.unscale_(self.actor_opt)
+        self._allreduce_grads(self.actor)
         self.scaler.step(self.actor_opt)
         self.scaler.update()
 
-        # ---------- Alpha ----------
+        # ---- Alpha ----
         with torch.no_grad(), ac:
             entropy = self.actor.entropy(obs).mean()
         alpha_loss = -(self.log_alpha * (entropy - self.target_entropy)).mean()
 
         self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
+        self._allreduce_param_grad(self.log_alpha)
         self.alpha_opt.step()
         self.alpha = self.log_alpha.exp().item()
 
-        # ---------- Soft target ----------
+        # ---- Soft target (local — stays in sync because critic stayed in sync) ----
         with torch.no_grad():
             for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
                 tp.data.mul_(1 - self.tau).add_(p.data, alpha=self.tau)
@@ -310,69 +284,53 @@ class MASACAgent(nn.Module):
         }
 
 
-# ============================================================
-# Training loop
-# ============================================================
-def train(config_path="config.yaml",
-          total_episodes=5000,
-          warmup_episodes=50,
-          lr=1e-3,
-          gamma=0.99,
-          tau=0.005,
-          seed=42,
-          log_dir="runs",
-          log_every_updates=20,
-          auto_tensorboard=True):
+def train(config_path="config.yaml", total_episodes=5000, warmup_episodes=50,
+          lr=1e-3, gamma=0.99, tau=0.005, seed=42, log_dir="runs",
+          log_every_updates=20, auto_tensorboard=True):
 
-    # ---------- DDP init ----------
     if "LOCAL_RANK" not in os.environ:
-        raise RuntimeError(
-            "Run with: python -m torch.distributed.run --nproc_per_node=2 train.py"
-        )
+        raise RuntimeError("Run via torch.distributed.run --nproc_per_node=2")
+
     local_rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group("nccl", init_method="env://")
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-
-    # Fix: use dist.get_rank() instead of local_rank so is_main is unambiguous
     global_rank = dist.get_rank()
-    is_main = (global_rank == 0)
+    world_size  = dist.get_world_size()
+    is_main     = (global_rank == 0)
 
-    # ---------- Seeding ----------
-    random.seed(seed + local_rank)
-    np.random.seed(seed + local_rank)
-    torch.manual_seed(seed + local_rank)
-    torch.backends.cudnn.benchmark = True
+    # ---- CRITICAL: same model init across ranks ----
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    # ---------- TensorBoard ----------
-    run_name = f"masac_t4x2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"masac_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_path = os.path.join(log_dir, run_name)
     writer   = SummaryWriter(run_path) if is_main else None
     tb_proc  = start_tensorboard(log_dir) if (auto_tensorboard and is_main) else None
 
     if is_main:
-        print(f"[Profile] hidden={HIDDEN}, batch={BATCH_SIZE} (DDP → {BATCH_SIZE // 2}/GPU)")
-        print(f"[Profile] buffer={BUFFER_CAPACITY}, update_every={UPDATE_EVERY}, amp={USE_AMP}")
-        print(f"[Threads] torch.set_num_threads({torch.get_num_threads()}), "
-              f"interop={torch.get_num_interop_threads()}")
-        print(f"[Device]  {device}, rank={global_rank}, world_size={dist.get_world_size()}")
-        print(f"[Logs]    {run_path}")
+        print(f"[Mode]    GRADIENT ALL-REDUCE (real data parallel)")
+        print(f"[Profile] hidden={HIDDEN}, batch={BATCH_SIZE} ({BATCH_SIZE//world_size}/GPU)")
+        print(f"[Profile] buffer={BUFFER_CAPACITY}/rank, update_every={UPDATE_EVERY}")
+        print(f"[Device]  {device}, rank={global_rank}, world_size={world_size}")
 
-    # ---------- Environment ----------
+    # ---- Env seeded PER RANK (different episodes) ----
     env = SheriffEnv(config_path)
-    env.reset(seed=seed)
+    env.reset(seed=seed + local_rank)
+    np.random.seed(seed + local_rank)
+    torch.manual_seed(seed + local_rank)
+
     agents_ids = env.possible_agents
     obs_dim    = env.observation_spaces[agents_ids[0]].shape[0]
     act_dims   = [int(x) for x in env.action_spaces[agents_ids[0]].nvec]
 
-    # ---------- Buffers + agents ----------
     buffers = {a: ReplayBuffer(BUFFER_CAPACITY, obs_dim, act_dims) for a in agents_ids}
 
-    agents = {}
-    for a in agents_ids:
-        agent = MASACAgent(obs_dim, act_dims, HIDDEN, lr, gamma, tau,
-                           use_amp=USE_AMP).to(device)
-        agents[a] = DDP(agent, device_ids=[local_rank], output_device=local_rank)
+    # Build agents AFTER seeding to seed — all ranks get identical weights
+    agents = {a: MASACAgent(obs_dim, act_dims, HIDDEN, lr, gamma, tau,
+                            use_amp=USE_AMP).to(device)
+              for a in agents_ids}
 
     if is_main:
         n_params = sum(p.numel() for p in agents[agents_ids[0]].parameters())
@@ -381,13 +339,10 @@ def train(config_path="config.yaml",
     if is_main:
         writer.add_hparams(
             {"hidden": HIDDEN, "batch_size": BATCH_SIZE, "buffer_cap": BUFFER_CAPACITY,
-             "update_every": UPDATE_EVERY, "use_amp": USE_AMP,
-             "lr": lr, "gamma": gamma, "tau": tau,
-             "total_eps": total_episodes, "world_size": dist.get_world_size()},
+             "update_every": UPDATE_EVERY, "lr": lr, "world_size": world_size},
             {},
         )
 
-    # ---------- State ----------
     episode_returns = {a: deque(maxlen=100) for a in agents_ids}
     episode_lengths = deque(maxlen=100)
     total_steps = 0
@@ -396,7 +351,8 @@ def train(config_path="config.yaml",
     info = {"actor_loss": 0.0, "critic_loss": 0.0, "alpha": 0.0,
             "entropy": 0.0, "mean_q": 0.0}
 
-    # ---------- Main loop ----------
+    per_rank_batch = BATCH_SIZE // world_size
+
     for ep in range(total_episodes):
         obs_dict, _ = env.reset()
         done = False
@@ -406,11 +362,10 @@ def train(config_path="config.yaml",
         while not done:
             actions = {}
             for a in env.agents:
-                # Fix: warmup multiplier is real episode length (70), not 300
                 if total_steps < warmup_episodes * WARMUP_STEPS:
                     actions[a] = env.action_spaces[a].sample()
                 else:
-                    actions[a] = agents[a].module.select_action(obs_dict[a], device)
+                    actions[a] = agents[a].select_action(obs_dict[a], device)
 
             next_obs_dict, rew_dict, term_dict, trunc_dict, _ = env.step(actions)
             done = all(term_dict.values()) or all(trunc_dict.values())
@@ -428,17 +383,14 @@ def train(config_path="config.yaml",
             if (total_steps >= warmup_episodes * WARMUP_STEPS
                 and total_steps % UPDATE_EVERY == 0):
                 for a in agents_ids:
-                    if len(buffers[a]) >= BATCH_SIZE:
-                        batch = buffers[a].sample(BATCH_SIZE, device)
+                    if len(buffers[a]) >= per_rank_batch:
+                        batch = buffers[a].sample(per_rank_batch, device)
                         info = agents[a].update(batch)
 
                         if is_main and update_count % log_every_updates == 0:
                             tag = f"agent/{a}"
-                            writer.add_scalar(f"{tag}/actor_loss",  info["actor_loss"],  update_count)
-                            writer.add_scalar(f"{tag}/critic_loss", info["critic_loss"], update_count)
-                            writer.add_scalar(f"{tag}/alpha",       info["alpha"],       update_count)
-                            writer.add_scalar(f"{tag}/entropy",     info["entropy"],     update_count)
-                            writer.add_scalar(f"{tag}/mean_q",      info["mean_q"],      update_count)
+                            for k in ["actor_loss", "critic_loss", "alpha", "entropy", "mean_q"]:
+                                writer.add_scalar(f"{tag}/{k}", info[k], update_count)
                         update_count += 1
 
         for a in agents_ids:
@@ -456,24 +408,28 @@ def train(config_path="config.yaml",
 
             if (ep + 1) % 50 == 0:
                 avg = {a: np.mean(episode_returns[a]) for a in agents_ids}
-                print(f"Ep {ep+1:5d} | "
-                      + " | ".join([f"{a}: {avg[a]:7.2f}" for a in agents_ids])
-                      + f" | ep_len: {np.mean(episode_lengths):6.1f}")
+                print(f"Ep {ep+1:5d} | " +
+                      " | ".join([f"{a}: {avg[a]:7.2f}" for a in agents_ids]) +
+                      f" | ep_len: {np.mean(episode_lengths):6.1f}")
                 print(f"        actor_loss={info['actor_loss']:.4f} "
                       f"critic_loss={info['critic_loss']:.4f} "
                       f"alpha={info['alpha']:.4f} entropy={info['entropy']:.3f}")
 
-    # ---------- Save ----------
+    # ---- Save from rank 0 only (weights identical across ranks) ----
     if is_main:
         os.makedirs("masac_checkpoints", exist_ok=True)
         for a in agents_ids:
-            inner = agents[a].module
             torch.save({
-                "actor":         inner.actor.state_dict(),
-                "critic":        inner.critic.state_dict(),
-                "critic_target": inner.critic_target.state_dict(),
+                "actor":         agents[a].actor.state_dict(),
+                "critic":        agents[a].critic.state_dict(),
+                "critic_target": agents[a].critic_target.state_dict(),
             }, f"masac_checkpoints/{a}.pt")
         print("Saved → masac_checkpoints/")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    if is_main:
         writer.flush()
         writer.close()
         _safe_kill(tb_proc)
@@ -481,26 +437,20 @@ def train(config_path="config.yaml",
     dist.destroy_process_group()
 
 
-# ============================================================
-# Entry
-# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="MASAC training on SheriffEnv (2× T4)")
-    parser.add_argument("--episodes", type=int,   default=5000)
-    parser.add_argument("--warmup",   type=int,   default=50)
-    parser.add_argument("--lr",       type=float, default=1e-3)
-    parser.add_argument("--seed",     type=int,   default=42)
-    parser.add_argument("--no-tb",    action="store_true")
-    args = parser.parse_args()
-
-    train(
-        config_path="config.yaml",
-        total_episodes=args.episodes,
-        warmup_episodes=args.warmup,
-        lr=args.lr,
-        seed=args.seed,
-        auto_tensorboard=(not args.no_tb),
-    )
+    p = argparse.ArgumentParser()
+    p.add_argument("--episodes", type=int,   default=5000)
+    p.add_argument("--warmup",   type=int,   default=50)
+    p.add_argument("--lr",       type=float, default=1e-3)
+    p.add_argument("--seed",     type=int,   default=42)
+    p.add_argument("--no-tb",    action="store_true")
+    args = p.parse_args()
+    train(config_path="config.yaml",
+          total_episodes=args.episodes,
+          warmup_episodes=args.warmup,
+          lr=args.lr,
+          seed=args.seed,
+          auto_tensorboard=(not args.no_tb))
 
 
 if __name__ == "__main__":
